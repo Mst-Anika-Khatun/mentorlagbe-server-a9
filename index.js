@@ -19,435 +19,628 @@ app.use(express.json());
 const mongo = await MongoClient.connect(process.env.MONGODB_URI);
 const db = mongo.db("mentorlagbe");
 
-// Database collections
+// Collections
 const users = db.collection("users");
 const tuitions = db.collection("tuitions");
 const applications = db.collection("applications");
 const payments = db.collection("payments");
 
-// Create unique indexes
+// Database indexes
 await applications.createIndex(
-    { tuitionId: 1, email: 1 },
-    { unique: true }
+  { tuitionId: 1, email: 1 },
+  { unique: true }
 );
 
 await payments.createIndex(
-    { sessionId: 1 },
-    { unique: true }
+  { sessionId: 1 },
+  { unique: true }
 );
 
-// Authentication and Stripe configuration
+// Authentication
 const jwks = createRemoteJWKSet(
-    new URL(url + "/api/auth/jwks")
+  new URL(url + "/api/auth/jwks")
 );
 
 const stripe = process.env.STRIPE_SECRET_KEY
-    ? new Stripe(process.env.STRIPE_SECRET_KEY)
-    : null;
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
 
-const id = x => new ObjectId(x);
+const id = (value) => new ObjectId(value);
 
-const fail = (r, m, s = 400) => {
-    return r.status(s).json({ error: m });
+const fail = (res, message, status = 400) => {
+  return res.status(status).json({ error: message });
 };
 
-// Verify authenticated user
-async function auth(req, res, next) {
-    try {
-        const token = req.headers.authorization?.split(" ")[1];
-
-        const { payload } = await jwtVerify(token, jwks, {
-            issuer: url,
-            audience: url
-        });
-
-        const email = payload.email;
-
-        if (!email) {
-            return fail(res, "Missing email", 401);
-        }
-
-        req.email = email;
-        req.account = await users.findOne({ email });
-
-        next();
-    } catch {
-        return fail(res, "Sign in required", 401);
-    }
+function validId(value) {
+  return typeof value === "string" &&
+    /^[a-fA-F0-9]{24}$/.test(value);
 }
 
-// Verify user role
-const role = (...roles) => (q, r, n) => {
-    return roles.includes(q.account?.role)
-        ? n()
-        : fail(r, "Forbidden", 403);
-};
+// Verify logged-in user
+async function auth(req, res, next) {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
 
-// Server health check
-app.get("/", (q, r) => {
-    r.json({ name: "MentorLagbe API" });
-});
-
-// Create or update user profile
-app.post("/profile", auth, async (q, r) => {
-    const selectedRole = String(
-        q.body.role || ""
-    ).trim().toLowerCase();
-
-    const adminEmail = String(
-        process.env.ADMIN_EMAIL || ""
-    ).trim().toLowerCase();
-
-    let userRole;
-
-    if (adminEmail && q.email.toLowerCase() === adminEmail) {
-        userRole = "Admin";
-    } else if (q.account?.role === "Tutor") {
-        userRole = "Tutor";
-    } else if (q.account?.role === "Student") {
-        userRole = "Student";
-    } else {
-        userRole = selectedRole === "tutor"
-            ? "Tutor"
-            : "Student";
+    if (!token) {
+      return fail(res, "Sign in required", 401);
     }
 
-    await users.updateOne(
-        { email: q.email },
-        {
-            $setOnInsert: {
-                email: q.email,
-                plan: "free"
-            },
-            $set: {
-                role: userRole,
-                name: String(q.body.name || ""),
-                photo: String(q.body.photo || "")
-            }
-        },
-        { upsert: true }
-    );
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer: url,
+      audience: url
+    });
 
-    r.json(await users.findOne({ email: q.email }));
+    if (!payload.email) {
+      return fail(res, "Missing email", 401);
+    }
+
+    req.email = String(payload.email);
+    req.account = await users.findOne({
+      email: req.email
+    });
+
+    next();
+  } catch (error) {
+    return fail(res, "Sign in required", 401);
+  }
+}
+
+// Role authorization
+const role = (...roles) => (req, res, next) => {
+  if (roles.includes(req.account?.role)) {
+    return next();
+  }
+
+  return fail(res, "Forbidden", 403);
+};
+
+// Server health
+app.get("/", (req, res) => {
+  res.json({ name: "MentorLagbe API" });
 });
 
-// Get user profile
-app.get("/profile", auth, (q, r) => {
-    r.json(q.account);
+// Create or update profile
+app.post("/profile", auth, async (req, res) => {
+  const selectedRole = String(
+    req.body.role || ""
+  ).trim().toLowerCase();
+
+  const adminEmail = String(
+    process.env.ADMIN_EMAIL || ""
+  ).trim().toLowerCase();
+
+  const currentRole = req.account?.role;
+
+  let userRole = currentRole || "Student";
+
+  if (
+    adminEmail &&
+    req.email.toLowerCase() === adminEmail
+  ) {
+    userRole = "Admin";
+  } else if (
+    process.env.NODE_ENV !== "production" &&
+    ["student", "tutor"].includes(selectedRole)
+  ) {
+    // Local testing only
+    userRole = selectedRole === "tutor"
+      ? "Tutor"
+      : "Student";
+  } else if (!currentRole) {
+    userRole = selectedRole === "tutor"
+      ? "Tutor"
+      : "Student";
+  }
+
+  const fields = {
+    role: userRole
+  };
+
+  if (req.body.name !== undefined) {
+    fields.name = String(req.body.name);
+  }
+
+  if (req.body.photo !== undefined) {
+    fields.photo = String(req.body.photo);
+  }
+
+  await users.updateOne(
+    { email: req.email },
+    {
+      $setOnInsert: {
+        email: req.email,
+        plan: "free"
+      },
+      $set: fields
+    },
+    { upsert: true }
+  );
+
+  res.json(await users.findOne({
+    email: req.email
+  }));
+});
+
+// Get profile
+app.get("/profile", auth, async (req, res) => {
+  res.json(req.account);
 });
 
 // Get approved tuitions
-app.get("/tuitions", async (q, r) => {
-    const result = await tuitions.find({
-        status: "approved",
-        active: true
-    }).sort({ _id: -1 }).toArray();
+app.get("/tuitions", async (req, res) => {
+  const result = await tuitions.find({
+    status: "approved",
+    active: true
+  }).sort({ _id: -1 }).toArray();
 
-    r.json(result);
+  res.json(result);
 });
 
-// Get tuition details
-app.get("/tuitions/:id", async (q, r) => {
-    const tuition = await tuitions.findOne({
-        _id: id(q.params.id),
-        status: "approved",
-        active: true
-    });
+// Get single tuition
+app.get("/tuitions/:id", async (req, res) => {
+  if (!validId(req.params.id)) {
+    return fail(res, "Invalid tuition ID");
+  }
 
-    tuition
-        ? r.json(tuition)
-        : fail(r, "Not found", 404);
+  const tuition = await tuitions.findOne({
+    _id: id(req.params.id),
+    status: "approved",
+    active: true
+  });
+
+  if (!tuition) {
+    return fail(res, "Not found", 404);
+  }
+
+  res.json(tuition);
 });
 
 // Create tuition
-app.post("/tuitions", auth, role("Tutor"), async (q, r) => {
+app.post(
+  "/tuitions",
+  auth,
+  role("Tutor"),
+  async (req, res) => {
     if (
-        q.account.plan !== "pro" &&
-        await tuitions.countDocuments({ email: q.email }) >= 2
+      req.account.plan !== "pro" &&
+      await tuitions.countDocuments({
+        email: req.email
+      }) >= 2
     ) {
-        return fail(r, "Upgrade to Pro");
+      return fail(res, "Upgrade to Pro");
     }
 
     const {
-        title,
-        subject,
-        location,
-        salary,
-        description
-    } = q.body;
+      title,
+      subject,
+      location,
+      salary,
+      description
+    } = req.body;
 
-    if (!title || !subject || !location || !salary) {
-        return fail(r, "Complete all fields");
+    if (
+      !title ||
+      !subject ||
+      !location ||
+      !Number.isFinite(Number(salary)) ||
+      Number(salary) <= 0
+    ) {
+      return fail(res, "Complete all fields");
     }
 
     const result = await tuitions.insertOne({
-        title,
-        subject,
-        location,
-        salary: Number(salary),
-        description,
-        email: q.email,
-        status: "pending",
-        active: true,
-        createdAt: new Date()
+      title,
+      subject,
+      location,
+      salary: Number(salary),
+      description,
+      email: req.email,
+      status: "pending",
+      active: true,
+      createdAt: new Date()
     });
 
-    r.json(result);
-});
+    res.json(result);
+  }
+);
 
-// Get tutor's own tuitions
-app.get("/mine", auth, role("Tutor"), async (q, r) => {
+// Tutor's own tuitions
+app.get(
+  "/mine",
+  auth,
+  role("Tutor"),
+  async (req, res) => {
     const result = await tuitions.find({
-        email: q.email
+      email: req.email
     }).toArray();
 
-    r.json(result);
-});
+    res.json(result);
+  }
+);
 
 // Update tuition
-app.patch("/tuitions/:id", auth, role("Tutor"), async (q, r) => {
+app.patch(
+  "/tuitions/:id",
+  auth,
+  role("Tutor"),
+  async (req, res) => {
+    if (!validId(req.params.id)) {
+      return fail(res, "Invalid tuition ID");
+    }
+
     const fields = {};
 
-    for (const k of [
-        "title",
-        "subject",
-        "location",
-        "salary",
-        "description",
-        "active"
+    for (const key of [
+      "title",
+      "subject",
+      "location",
+      "salary",
+      "description",
+      "active"
     ]) {
-        if (k in q.body) {
-            fields[k] = q.body[k];
-        }
+      if (key in req.body) {
+        fields[key] = req.body[key];
+      }
+    }
+
+    if ("salary" in fields) {
+      fields.salary = Number(fields.salary);
+
+      if (
+        !Number.isFinite(fields.salary) ||
+        fields.salary <= 0
+      ) {
+        return fail(res, "Invalid salary");
+      }
+    }
+
+    if ("active" in fields) {
+      if (typeof fields.active !== "boolean") {
+        return fail(res, "Invalid active value");
+      }
+    }
+
+    if (!Object.keys(fields).length) {
+      return fail(res, "No fields to update");
     }
 
     const result = await tuitions.updateOne(
-        {
-            _id: id(q.params.id),
-            email: q.email
-        },
-        {
-            $set: {
-                ...fields,
-                status: "pending"
-            }
+      {
+        _id: id(req.params.id),
+        email: req.email
+      },
+      {
+        $set: {
+          ...fields,
+          status: "pending"
         }
+      }
     );
 
-    r.json(result);
-});
+    res.json(result);
+  }
+);
 
 // Delete tuition
-app.delete("/tuitions/:id", auth, role("Tutor"), async (q, r) => {
+app.delete(
+  "/tuitions/:id",
+  auth,
+  role("Tutor"),
+  async (req, res) => {
+    if (!validId(req.params.id)) {
+      return fail(res, "Invalid tuition ID");
+    }
+
     const result = await tuitions.deleteOne({
-        _id: id(q.params.id),
-        email: q.email
+      _id: id(req.params.id),
+      email: req.email
     });
 
-    r.json(result);
-});
+    res.json(result);
+  }
+);
 
-// Submit tuition application
-app.post("/applications", auth, role("Student"), async (q, r) => {
-    const { tuitionId, phone, schedule, note } = q.body;
+// Submit application
+app.post(
+  "/applications",
+  auth,
+  role("Student"),
+  async (req, res) => {
+    const {
+      tuitionId,
+      phone,
+      schedule,
+      note
+    } = req.body;
+
+    if (!validId(tuitionId)) {
+      return fail(res, "Invalid tuition ID");
+    }
 
     const tuition = await tuitions.findOne({
-        _id: id(tuitionId),
-        status: "approved",
-        active: true
+      _id: id(tuitionId),
+      status: "approved",
+      active: true
     });
 
     if (!tuition || !phone || !schedule) {
-        return fail(r, "Invalid application");
+      return fail(res, "Invalid application");
     }
 
     try {
-        const result = await applications.insertOne({
-            tuitionId,
-            email: q.email,
-            tutor: tuition.email,
-            title: tuition.title,
-            phone,
-            schedule,
-            note,
-            status: "pending"
-        });
+      const result = await applications.insertOne({
+        tuitionId,
+        email: req.email,
+        tutor: tuition.email,
+        title: tuition.title,
+        phone,
+        schedule,
+        note,
+        status: "pending",
+        createdAt: new Date()
+      });
 
-        r.json(result);
-    } catch (e) {
-        if (e.code === 11000) {
-            return fail(r, "Already applied");
-        }
+      res.json(result);
+    } catch (error) {
+      if (error.code === 11000) {
+        return fail(res, "Already applied");
+      }
 
-        throw e;
+      throw error;
     }
-});
+  }
+);
 
-// Get user applications
-app.get("/applications", auth, async (q, r) => {
-    const filter = q.account?.role === "Tutor"
-        ? { tutor: q.email }
-        : { email: q.email };
+// Get applications
+app.get(
+  "/applications",
+  auth,
+  async (req, res) => {
+    const filter =
+      req.account?.role === "Tutor"
+        ? { tutor: req.email }
+        : { email: req.email };
 
-    r.json(await applications.find(filter).toArray());
-});
+    const result = await applications
+      .find(filter)
+      .sort({ _id: -1 })
+      .toArray();
+
+    res.json(result);
+  }
+);
 
 // Accept or reject application
-app.patch("/applications/:id", auth, role("Tutor"), async (q, r) => {
-    if (!["accepted", "rejected"].includes(q.body.status)) {
-        return fail(r, "Invalid status");
+app.patch(
+  "/applications/:id",
+  auth,
+  role("Tutor"),
+  async (req, res) => {
+    if (!validId(req.params.id)) {
+      return fail(res, "Invalid application ID");
+    }
+
+    if (
+      !["accepted", "rejected"].includes(
+        req.body.status
+      )
+    ) {
+      return fail(res, "Invalid status");
     }
 
     const result = await applications.updateOne(
-        {
-            _id: id(q.params.id),
-            tutor: q.email,
-            status: "pending"
-        },
-        {
-            $set: { status: q.body.status }
+      {
+        _id: id(req.params.id),
+        tutor: req.email,
+        status: "pending"
+      },
+      {
+        $set: {
+          status: req.body.status
         }
+      }
     );
 
-    r.json(result);
-});
+    res.json(result);
+  }
+);
 
 // Cancel application
-app.delete("/applications/:id", auth, role("Student"), async (q, r) => {
-    const result = await applications.deleteOne({
-        _id: id(q.params.id),
-        email: q.email,
-        status: "pending"
-    });
-
-    r.json(result);
-});
-
-// Admin dashboard records
-app.get("/admin/:collection", auth, role("Admin"), async (q, r) => {
-    if (!["users", "tuitions", "payments"].includes(q.params.collection)) {
-        return fail(r, "Invalid collection");
+app.delete(
+  "/applications/:id",
+  auth,
+  role("Student"),
+  async (req, res) => {
+    if (!validId(req.params.id)) {
+      return fail(res, "Invalid application ID");
     }
 
-    const result = await db.collection(
-        q.params.collection
-    ).find().toArray();
+    const result = await applications.deleteOne({
+      _id: id(req.params.id),
+      email: req.email,
+      status: "pending"
+    });
 
-    r.json(result);
-});
+    res.json(result);
+  }
+);
 
-// Admin tuition approval
-app.patch("/admin/tuitions/:id", auth, role("Admin"), async (q, r) => {
-    if (!["approved", "rejected"].includes(q.body.status)) {
-        return fail(r, "Invalid status");
+// Admin records
+app.get(
+  "/admin/:collection",
+  auth,
+  role("Admin"),
+  async (req, res) => {
+    const allowed = [
+      "users",
+      "tuitions",
+      "payments"
+    ];
+
+    if (!allowed.includes(req.params.collection)) {
+      return fail(res, "Invalid collection");
+    }
+
+    const result = await db
+      .collection(req.params.collection)
+      .find()
+      .toArray();
+
+    res.json(result);
+  }
+);
+
+// Admin approve or reject tuition
+app.patch(
+  "/admin/tuitions/:id",
+  auth,
+  role("Admin"),
+  async (req, res) => {
+    if (!validId(req.params.id)) {
+      return fail(res, "Invalid tuition ID");
+    }
+
+    if (
+      !["approved", "rejected"].includes(
+        req.body.status
+      )
+    ) {
+      return fail(res, "Invalid status");
     }
 
     const result = await tuitions.updateOne(
-        { _id: id(q.params.id) },
-        { $set: { status: q.body.status } }
+      { _id: id(req.params.id) },
+      {
+        $set: {
+          status: req.body.status
+        }
+      }
     );
 
-    r.json(result);
-});
+    res.json(result);
+  }
+);
 
-// Create Stripe checkout
-app.post("/checkout", auth, role("Student", "Tutor"), async (q, r) => {
+// Stripe checkout
+app.post(
+  "/checkout",
+  auth,
+  role("Student", "Tutor"),
+  async (req, res) => {
     if (!stripe) {
-        return fail(r, "Stripe not configured");
+      return fail(res, "Stripe not configured");
     }
 
     const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-
-        line_items: [
-            {
-                price_data: {
-                    currency: "usd",
-                    product_data: {
-                        name: q.account.role + " Pro"
-                    },
-                    unit_amount: q.account.role === "Tutor"
-                        ? 1500
-                        : 1000
-                },
-                quantity: 1
-            }
-        ],
-
-        metadata: {
-            email: q.email
-        },
-
-        success_url:
-            url + "/payment/success?session_id={CHECKOUT_SESSION_ID}",
-
-        cancel_url:
-            url + "/payment/cancel"
+      mode: "payment",
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: req.account.role + " Pro"
+            },
+            unit_amount:
+              req.account.role === "Tutor"
+                ? 1500
+                : 1000
+          },
+          quantity: 1
+        }
+      ],
+      metadata: {
+        email: req.email
+      },
+      success_url:
+        url +
+        "/payment/success?session_id={CHECKOUT_SESSION_ID}",
+      cancel_url:
+        url + "/payment/cancel"
     });
 
-    r.json({ url: session.url });
-});
+    res.json({ url: session.url });
+  }
+);
 
-// Verify Stripe payment
-app.post("/payment/verify", auth, async (q, r) => {
+// Verify payment
+app.post(
+  "/payment/verify",
+  auth,
+  async (req, res) => {
     if (!stripe) {
-        return fail(r, "Stripe not configured");
+      return fail(res, "Stripe not configured");
     }
 
-    const session = await stripe.checkout.sessions.retrieve(
-        q.body.sessionId
-    );
+    if (!req.body.sessionId) {
+      return fail(res, "Missing session ID");
+    }
+
+    const session =
+      await stripe.checkout.sessions.retrieve(
+        req.body.sessionId
+      );
 
     if (
-        session.payment_status !== "paid" ||
-        session.metadata?.email !== q.email
+      session.payment_status !== "paid" ||
+      session.metadata?.email !== req.email
     ) {
-        return fail(r, "Payment not verified");
+      return fail(res, "Payment not verified");
     }
 
     await payments.updateOne(
-        { sessionId: session.id },
-        {
-            $setOnInsert: {
-                sessionId: session.id,
-                email: q.email,
-                amount: session.amount_total / 100,
-                status: "paid",
-                date: new Date()
-            }
-        },
-        { upsert: true }
+      { sessionId: session.id },
+      {
+        $setOnInsert: {
+          sessionId: session.id,
+          email: req.email,
+          amount: session.amount_total / 100,
+          status: "paid",
+          date: new Date()
+        }
+      },
+      { upsert: true }
     );
 
     await users.updateOne(
-        { email: q.email },
-        { $set: { plan: "pro" } }
+      { email: req.email },
+      {
+        $set: {
+          plan: "pro"
+        }
+      }
     );
 
-    r.json({ success: true });
-});
+    res.json({ success: true });
+  }
+);
 
-// Get payment history
-app.get("/payments", auth, async (q, r) => {
+// Payment history
+app.get(
+  "/payments",
+  auth,
+  async (req, res) => {
     const result = await payments.find({
-        email: q.email
+      email: req.email
     }).sort({ date: -1 }).toArray();
 
-    r.json(result);
-});
+    res.json(result);
+  }
+);
 
-// Error handling
-app.use((e, q, r, n) => {
-    console.error(e);
+// Error handler
+app.use((error, req, res, next) => {
+  console.error(error);
 
-    r.status(500).json({
-        error: "Request failed"
-    });
+  res.status(500).json({
+    error: "Request failed"
+  });
 });
 
 // Start server
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-    console.log("MentorLagbe server running on port " + PORT);
+  console.log(
+    "MentorLagbe server running on port " + PORT
+  );
 });
